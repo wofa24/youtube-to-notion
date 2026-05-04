@@ -73,6 +73,7 @@ def process_subtitles(
     max_seconds: float = DEFAULT_MAX_SECONDS,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     resume_index: int = 0,
+    segment_callback: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict]:
     """
     主处理循环：逐句截图、去重、强制分段。
@@ -140,13 +141,16 @@ def process_subtitles(
         if scene_changed or force_split:
             # 保存上一段（如果有内容）
             if text_buffer and current_image_path:
-                segments.append({
+                seg = {
                     "image_path": current_image_path,
                     "text": " ".join(text_buffer),
                     "start": seg_start,
                     "end": sub["start"],
                     "subtitle_index": i - 1,
-                })
+                }
+                segments.append(seg)
+                if segment_callback:
+                    segment_callback(seg)
 
             # 开始新段
             current_image_path = img_path
@@ -170,12 +174,15 @@ def process_subtitles(
     # 处理最后一段
     if text_buffer and current_image_path:
         last_sub = subtitles[-1] if subtitles else {"end": 0}
-        segments.append({
+        seg = {
             "image_path": current_image_path,
             "text": " ".join(text_buffer),
             "start": seg_start,
             "end": last_sub["end"],
             "subtitle_index": total - 1,
-        })
+        }
+        segments.append(seg)
+        if segment_callback:
+            segment_callback(seg)
 
     return segments

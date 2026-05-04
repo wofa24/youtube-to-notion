@@ -173,12 +173,14 @@ function setupEventListeners() {
 // ─────────────────────────────────────────────
 
 async function onStartClick() {
+  btnStart.disabled = true;  // 立即禁用，防止重复点击
+
   const token = document.getElementById("notion-token").value.trim();
   const dbId = cleanDatabaseId(document.getElementById("database-id").value);
 
-  if (!token) { showError("请填写 Notion Token"); return; }
-  if (!dbId) { showError("请填写 Database ID"); return; }
-  if (!currentVideoUrl) { showError("未检测到 YouTube 视频，请在视频页面使用"); return; }
+  if (!token) { showError("请填写 Notion Token"); btnStart.disabled = false; return; }
+  if (!dbId) { showError("请填写 Database ID"); btnStart.disabled = false; return; }
+  if (!currentVideoUrl) { showError("未检测到 YouTube 视频，请在视频页面使用"); btnStart.disabled = false; return; }
 
   saveConfig();
   hideError();

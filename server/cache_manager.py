@@ -46,3 +46,23 @@ def clear_progress(video_id: str):
 
 def has_progress(video_id: str) -> bool:
     return os.path.exists(_cache_path(video_id))
+
+
+def get_any_in_progress() -> Optional[str]:
+    """扫描缓存目录，返回第一个未完成任务的 video_id，无则返回 None。"""
+    _ensure_dir()
+    try:
+        for fname in os.listdir(CACHE_DIR):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(CACHE_DIR, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not data.get("completed"):
+                    return fname[:-5]  # strip ".json"
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
