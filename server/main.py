@@ -3,11 +3,13 @@ main.py
 FastAPI 服务入口。
 提供 REST API 供 Chrome 扩展调用，SSE 推送实时进度。
 
-异步流水线架构（生产者-消费者）：
-  生产者：在独立线程中执行截帧，每凑满 COMPOSITE_SIZE 帧，
-          通过 asyncio.run_coroutine_threadsafe 将任务投入 asyncio.Queue。
-  消费者：UPLOAD_WORKERS 个 async 协程并发从队列取任务，
-          在 ThreadPoolExecutor 中调用上传函数，完全与截帧解耦。
+异步流水线（生产者-消费者 + Semaphore）：
+  生产者：截帧线程（process_subtitles）每凑满 COMPOSITE_SIZE 帧，
+          同步生成合成图，然后通过 asyncio.run_coroutine_threadsafe
+          立即在事件循环中创建上传 Task，无需等待后续截帧完成。
+  并发控制：asyncio.Semaphore(UPLOAD_CONCURRENCY=3) 保证最多 3 个
+          上传请求同时在途，恰好打满 Notion 3 req/s 配额。
+  顺序保证：results[gi] 按组编号写入，所有 Task 完成后按序合并 blocks。
 """
 
 import asyncio
@@ -36,8 +38,8 @@ from fetcher import get_video_info, get_subtitles, get_video_local_path
 from processor import process_subtitles
 from uploader import (
     create_notion_page, get_page_url,
-    upload_group_and_build, append_blocks,
-    COMPOSITE_SIZE, UPLOAD_WORKERS,
+    make_group_composite, upload_and_build, append_blocks,
+    COMPOSITE_SIZE, UPLOAD_WORKERS, UPLOAD_CONCURRENCY,
 )
 
 app = FastAPI(title="YouTube to Notion")
@@ -49,7 +51,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 内存任务表（单进程生命周期内有效）
 _tasks: Dict[str, Dict[str, Any]] = {}
 
 
@@ -89,60 +90,21 @@ def _update_task(task_id: str, **kwargs):
 
 
 # ─────────────────────────────────────────────
-# 异步消费者协程
-# ─────────────────────────────────────────────
-
-async def _upload_worker(
-    queue: asyncio.Queue,
-    page_id: str,
-    token: str,
-    video_url: str,
-    results: Dict[int, list],
-    executor: ThreadPoolExecutor,
-    task_id: str,
-):
-    """
-    消费者：持续从队列取出 (gi, group) 并上传。
-    队列中放入 None 作为哨兵信号，收到后退出。
-    上传结果按 gi 存入 results，供主协程按序合并。
-    """
-    loop = asyncio.get_event_loop()
-    while True:
-        item = await queue.get()
-        if item is None:          # 哨兵：生产者已完成
-            queue.task_done()
-            break
-        gi, group = item
-        try:
-            blocks = await loop.run_in_executor(
-                executor,
-                upload_group_and_build,
-                group, page_id, token, gi, video_url,
-            )
-        except Exception as e:
-            print(f"[main] 上传组 {gi} 异常: {e}")
-            blocks = []
-        results[gi] = blocks
-        queue.task_done()
-        _update_task(task_id, message=f"已上传第 {gi + 1} 组图片...")
-
-
-# ─────────────────────────────────────────────
-# 异步流水线主体
+# 异步流水线
 # ─────────────────────────────────────────────
 
 async def _async_pipeline(task_id: str, req: ProcessRequest):
     """
-    异步流水线：
-      1. 生产者在线程池中运行 process_subtitles（截帧 + 去重）。
-         每凑满 COMPOSITE_SIZE 帧，通过 run_coroutine_threadsafe 投入队列。
-      2. UPLOAD_WORKERS 个消费者协程并发上传，
-         在独立 ThreadPoolExecutor 中调用 upload_group_and_build。
-      3. 截帧与上传完全并发，显著缩短总耗时。
+    核心流水线：
+      • 截帧在 screen_exec 线程池执行（不阻塞事件循环）
+      • 每凑满一组，_on_segment 回调同步生成合成图，
+        然后用 run_coroutine_threadsafe 即刻向事件循环投递上传 Task
+      • Semaphore(UPLOAD_CONCURRENCY) 确保恰好 3 个上传同时在途
+      • 截帧期间上传已经在并发执行，两者完全重叠
     """
-    token  = req.notion_token or NOTION_TOKEN
-    db_id  = req.database_id  or NOTION_DATABASE_ID
-    loop   = asyncio.get_event_loop()
+    token = req.notion_token or NOTION_TOKEN
+    db_id = req.database_id  or NOTION_DATABASE_ID
+    loop  = asyncio.get_event_loop()
 
     def progress(current: int, total: int, msg: str):
         _update_task(task_id, progress_current=current, progress_total=total, message=msg)
@@ -152,7 +114,7 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
         _update_task(task_id, status="running", message="获取视频信息...")
         cache_manager.update_status(video_id, cache_manager.STATUS_PROCESSING)
 
-        # ── 断点续传 ──────────────────────────────────────
+        # ── 断点续传 ────────────────────────────────────
         cached = cache_manager.load_progress(video_id) if req.resume else None
         resume_subtitle_index = 0
         page_id          = None
@@ -166,7 +128,7 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
             cached_segments       = cached.get("segments", [])
             _update_task(task_id, message=f"断点续传，从第 {resume_subtitle_index} 条字幕继续...")
 
-        # ── 获取视频信息 & 字幕 ───────────────────────────
+        # ── 获取视频信息 & 字幕 ──────────────────────────
         info  = await loop.run_in_executor(None, get_video_info, req.url)
         title = info["title"]
         _update_task(task_id, title=title, message="获取字幕...")
@@ -178,7 +140,7 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
             if not subtitles:
                 raise RuntimeError("未能获取到字幕，请检查视频是否有字幕或 Whisper 是否安装")
 
-        # ── 下载视频（供 ffmpeg 本地截帧）────────────────
+        # ── 下载视频 ─────────────────────────────────────
         _update_task(task_id, message="下载视频（用于截图）...")
         local_video_path = await loop.run_in_executor(
             None, get_video_local_path, req.url, video_id
@@ -190,7 +152,6 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
                 None, create_notion_page, title, req.url, token, db_id
             )
 
-        # 持久化初始进度
         cache_manager.save_progress(video_id, {
             "status":         cache_manager.STATUS_PROCESSING,
             "page_id":        page_id,
@@ -201,41 +162,70 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
             "title":          title,
         })
 
-        # ── 构建生产者-消费者管道 ─────────────────────────
-        # 队列容量 = 消费者数 × 2，超出时生产者自动等待（背压）
-        queue: asyncio.Queue = asyncio.Queue(maxsize=UPLOAD_WORKERS * 2)
-        results: Dict[int, list] = {}
+        # ── 并发控制与任务容器 ───────────────────────────
+        # Semaphore 限制同时在途的上传请求数，对齐 Notion 3 req/s 配额
+        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        results: Dict[int, list] = {}   # gi → blocks，供最终按序合并
+        task_refs: list = []            # asyncio.Task 引用，用于 gather
         upload_exec = ThreadPoolExecutor(max_workers=UPLOAD_WORKERS)
 
-        # 启动消费者
-        workers = [
-            asyncio.create_task(
-                _upload_worker(queue, page_id, token, req.url, results, upload_exec, task_id)
-            )
-            for _ in range(UPLOAD_WORKERS)
-        ]
+        # ── 上传协程（每组一个 Task）────────────────────
+        async def _upload_one(gi: int, group: list, comp_path: str):
+            """
+            获取 Semaphore 后在线程池中执行实际上传。
+            Semaphore 控制并发，确保 ≤ UPLOAD_CONCURRENCY 个请求同时在途。
+            """
+            async with sem:
+                try:
+                    blocks = await loop.run_in_executor(
+                        upload_exec,
+                        upload_and_build,
+                        comp_path, group, token, gi, req.url,
+                    )
+                except Exception as e:
+                    print(f"[main] 上传组 {gi} 失败: {e}")
+                    blocks = []
+            results[gi] = blocks
+            done = len(results)
+            _update_task(task_id, message=f"上传进度 {done}/{_gi[0]} 组...")
 
-        # ── 生产者回调（在截帧线程中被调用）─────────────
-        _gi    = [0]
+        # 在事件循环中创建 Task 并记录引用（供 gather 等待）
+        async def _schedule_upload(gi: int, group: list, comp_path: str):
+            task = asyncio.create_task(_upload_one(gi, group, comp_path))
+            task_refs.append(task)
+
+        # ── 生产者回调（运行于 screen_exec 截帧线程）────
+        _gi    = [0]   # mutable int，跨线程共享组计数
         _batch: list = []
 
         def _on_segment(seg: dict):
-            """每产生一个 segment 时被调用；凑满一组后投入队列（有背压）。"""
+            """
+            每产生一个 segment 时被调用。
+            凑满 COMPOSITE_SIZE 帧后：
+              1. 在当前线程同步生成合成图（CPU 密集，约 30–80ms）
+              2. 立即向事件循环投递上传 Task（网络 I/O，与截帧并发执行）
+            future.result() 确保 Task 已入 task_refs 后再继续下一帧。
+            """
             _batch.append(seg)
             if len(_batch) >= COMPOSITE_SIZE:
                 gi    = _gi[0]; _gi[0] += 1
                 group = _batch.copy(); _batch.clear()
-                # 从子线程向事件循环所在线程安全地投递，并等待入队完成（背压）
-                future = asyncio.run_coroutine_threadsafe(queue.put((gi, group)), loop)
-                future.result()
+                # 同步生成合成图（截帧线程，非阻塞事件循环）
+                comp_path = make_group_composite(group, gi, page_id[:8])
+                if comp_path:
+                    # 立即在事件循环中调度上传 Task
+                    future = asyncio.run_coroutine_threadsafe(
+                        _schedule_upload(gi, group, comp_path), loop
+                    )
+                    future.result()  # 等待 Task 创建完成（微秒级），保证 task_refs 完整
 
-        # 续传：把缓存 segments 先走一遍回调，保持分组逻辑一致
+        # 续传：缓存 segments 先走回调（复用分组逻辑）
         for seg in cached_segments:
             _on_segment(seg)
 
         _update_task(task_id, message=f"共 {len(subtitles)} 条字幕，截图并上传中...")
 
-        # 截帧在独立线程池中运行，不阻塞事件循环，上传与截帧同时进行
+        # 截帧在独立线程池运行，上传 Task 在事件循环并发执行，两者完全重叠
         screen_exec = ThreadPoolExecutor(max_workers=2)
         new_segments = await loop.run_in_executor(
             screen_exec,
@@ -252,30 +242,26 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
             ),
         )
 
-        # 截帧完成，删除本地视频文件
+        # 截图完成，删除本地视频文件
         if os.path.exists(local_video_path):
             os.remove(local_video_path)
 
-        # 冲刷不足一组的剩余 segments
+        # 冲刷不足一组的剩余 segments（已在事件循环中，直接创建 Task）
         if _batch:
-            gi = _gi[0]
-            future = asyncio.run_coroutine_threadsafe(
-                queue.put((gi, _batch.copy())), loop
-            )
-            future.result()
+            gi = _gi[0]; _gi[0] += 1
+            comp_path = make_group_composite(_batch.copy(), gi, page_id[:8])
+            if comp_path:
+                task = asyncio.create_task(_upload_one(gi, _batch.copy(), comp_path))
+                task_refs.append(task)
 
-        # 等待所有已入队任务处理完毕
-        await queue.join()
-
-        # 发送哨兵，通知每个消费者退出
-        for _ in range(UPLOAD_WORKERS):
-            await queue.put(None)
-        await asyncio.gather(*workers)
+        # 等待所有上传 Task 完成（包括截帧期间已启动的并发上传）
+        if task_refs:
+            await asyncio.gather(*task_refs)
 
         upload_exec.shutdown(wait=False)
         screen_exec.shutdown(wait=False)
 
-        # ── 保存最终进度（含完整 segments，供续传恢复）──
+        # ── 保存最终进度 ─────────────────────────────────
         all_segments = cached_segments + new_segments
         cache_manager.save_progress(video_id, {
             "status":         cache_manager.STATUS_PROCESSING,
@@ -287,7 +273,7 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
             "title":          title,
         })
 
-        # ── 按组序号合并 blocks，一次性写入 Notion ──────
+        # ── 按组序号合并 blocks，一次性写入 Notion ───────
         total_segs = len(all_segments)
         _update_task(task_id, message="写入 Notion...", progress_total=total_segs)
 
@@ -324,15 +310,8 @@ async def _async_pipeline(task_id: str, req: ProcessRequest):
             pass
 
 
-# ─────────────────────────────────────────────
-# 后台线程入口
-# ─────────────────────────────────────────────
-
 def _run_pipeline(task_id: str, req: ProcessRequest):
-    """
-    在独立后台线程中创建新的 asyncio 事件循环，运行异步流水线。
-    FastAPI 的事件循环与这里完全隔离，互不干扰。
-    """
+    """在独立后台线程中创建新的 asyncio 事件循环，运行异步流水线。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -347,7 +326,6 @@ def _run_pipeline(task_id: str, req: ProcessRequest):
 
 @app.get("/health")
 def health():
-    """健康检查"""
     return {"status": "ok"}
 
 
@@ -355,17 +333,14 @@ def health():
 def start_process(req: ProcessRequest):
     """
     启动处理任务，返回 task_id。
-    冲突检测（三层）：
-      1. 内存中有 pending / running 任务 → 409
-      2. 缓存中有 processing 状态的其他视频 → 409
-      3. 当前视频缓存状态为 processing 且未开启断点续传 → 409
+    三层冲突检测（内存 → 其他视频缓存 → 当前视频缓存）。
     """
     try:
         video_id = _extract_video_id(req.url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # 层1：内存状态
+    # 层1：内存状态（同进程生命周期）
     running = next(
         (tid for tid, t in _tasks.items() if t.get("status") in ("pending", "running")),
         None,
@@ -412,7 +387,6 @@ def start_process(req: ProcessRequest):
 async def progress_stream(task_id: str):
     """SSE 实时进度推送。服务重启后任务不在内存中时，返回中断提示。"""
     if task_id not in _tasks:
-        # 服务重启场景：缓存显示 processing，但内存已清空
         cached = cache_manager.load_progress(task_id)
         if cached and cached.get("status") == cache_manager.STATUS_PROCESSING:
             _tasks[task_id] = {
@@ -447,7 +421,6 @@ def get_status(task_id: str):
 
 @app.get("/check_resume/{video_id}")
 def check_resume(video_id: str):
-    """检查断点续传缓存，返回状态供前端决策"""
     cached = cache_manager.load_progress(video_id)
     if cached:
         return {
@@ -461,7 +434,6 @@ def check_resume(video_id: str):
 
 @app.delete("/cache/{video_id}")
 def delete_cache(video_id: str):
-    """清除断点续传缓存"""
     cache_manager.clear_progress(video_id)
     return {"ok": True}
 
