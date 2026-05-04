@@ -116,7 +116,7 @@ def _upload_to_notion(image_path: str, token: str) -> Optional[str]:
                 step2 = client.post(
                     upload_url,
                     headers=base_headers,
-                    files={"file": (filename, f, "image/jpeg")},
+                    files={"file": (filename, f, "image/webp")},
                 )
             if step2.status_code not in (200, 201):
                 print(f"[uploader] Notion 文件上传失败 {step2.status_code}: {step2.text[:300]}")

@@ -5,7 +5,6 @@ processor.py
 
 import os
 import subprocess
-import time
 from typing import List, Dict, Callable, Optional
 
 import imagehash
@@ -38,7 +37,7 @@ def take_screenshot(stream_url: str, timestamp: float, out_path: str) -> bool:
         "-i", stream_url,
         "-frames:v", "1",
         "-vf", f"scale={SCREENSHOT_WIDTH}:-1",
-        "-q:v", "2",
+        "-q:v", "80",   # WebP quality: 0-100, higher = better
         "-y",
         out_path,
     ]
@@ -111,7 +110,7 @@ def process_subtitles(
             progress_callback(i + 1, total, f"截图中 ({i + 1}/{total})...")
 
         # 截图
-        img_path = os.path.join(TEMP_DIR, f"{video_id}_frame_{i:05d}.jpg")
+        img_path = os.path.join(TEMP_DIR, f"{video_id}_frame_{i:05d}.webp")
         success = take_screenshot(stream_url, ts, img_path)
 
         if not success:

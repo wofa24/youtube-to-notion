@@ -122,6 +122,7 @@ async function detectVideoUrl() {
 
     if (currentVideoId) {
       await checkResume(currentVideoId);
+      await checkActiveTask(currentVideoId);  // 自动重连正在运行的任务
     }
   } catch (e) {
     console.warn("获取视频 URL 失败:", e);
@@ -144,6 +145,26 @@ async function checkResume(videoId) {
     if (data.has_cache) {
       resumeText.textContent = `检测到未完成任务：${data.title || videoId}（已处理 ${data.subtitle_index} 条字幕）`;
       resumeBanner.classList.add("visible");
+    }
+    return data;
+  } catch (_) {}
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// 自动重连（弹窗重开时，任务仍在运行）
+// ─────────────────────────────────────────────
+
+async function checkActiveTask(videoId) {
+  try {
+    const resp = await fetch(`${API}/status/${videoId}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.status === "running" || data.status === "pending") {
+      // 服务器仍有该任务在运行，自动进入进度监听
+      btnStart.disabled = true;
+      showStatus(data.message || "任务进行中...", 0);
+      listenProgress(videoId);
     }
   } catch (_) {}
 }
@@ -185,6 +206,7 @@ async function onStartClick() {
   saveConfig();
   hideError();
   resultLink.classList.remove("visible");
+  showStatus("正在提交任务...", 0);
 
   const payload = {
     url: currentVideoUrl,
@@ -195,9 +217,6 @@ async function onStartClick() {
     max_seconds: parseFloat(document.getElementById("max-seconds").value),
     resume: true,
   };
-
-  btnStart.disabled = true;
-  showStatus("正在提交任务...", 0);
 
   try {
     const resp = await fetch(`${API}/process`, {
