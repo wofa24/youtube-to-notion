@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube to Notion</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 360px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      color: #1a1a1a;
+      background: #fff;
+    }
+
+    .header {
+      background: #000;
+      color: #fff;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header svg { flex-shrink: 0; }
+    .header h1 { font-size: 14px; font-weight: 600; }
+
+    .body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+
+    .field label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: #666;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .field input {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .field input:focus { border-color: #000; }
+
+    .row { display: flex; gap: 8px; }
+    .row .field { flex: 1; }
+
+    .advanced-toggle {
+      font-size: 11px;
+      color: #888;
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .advanced-toggle:hover { color: #333; }
+
+    .advanced { display: none; flex-direction: column; gap: 10px; }
+    .advanced.open { display: flex; }
+
+    .divider {
+      height: 1px;
+      background: #f0f0f0;
+    }
+
+    .btn {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: #000; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #222; }
+
+    /* 状态区 */
+    .status-box {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .status-box.visible { display: flex; }
+
+    .status-msg {
+      font-size: 12px;
+      color: #555;
+      min-height: 16px;
+    }
+
+    .progress-bar-wrap {
+      height: 6px;
+      background: #f0f0f0;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: #000;
+      border-radius: 3px;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    .result-link {
+      display: none;
+      padding: 10px;
+      background: #f6fff6;
+      border: 1px solid #b2dfb2;
+      border-radius: 8px;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 600;
+      color: #2e7d32;
+      text-decoration: none;
+    }
+    .result-link:hover { background: #e8f5e9; }
+    .result-link.visible { display: block; }
+
+    .error-msg {
+      display: none;
+      padding: 8px 10px;
+      background: #fff3f3;
+      border: 1px solid #ffcdd2;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #c62828;
+    }
+    .error-msg.visible { display: block; }
+
+    .server-status {
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      color: #888;
+    }
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+    }
+    .dot.online { background: #4caf50; }
+    .dot.offline { background: #f44336; }
+
+    .resume-banner {
+      display: none;
+      padding: 8px 10px;
+      background: #fff8e1;
+      border: 1px solid #ffe082;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #795548;
+      gap: 6px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .resume-banner.visible { display: flex; }
+    .resume-banner button {
+      background: none;
+      border: 1px solid #bcaaa4;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      color: #5d4037;
+      white-space: nowrap;
+    }
+    .resume-banner button:hover { background: #efebe9; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+    <rect width="24" height="24" rx="4" fill="#ff0000"/>
+    <polygon points="9.5,7 9.5,17 17,12" fill="white"/>
+  </svg>
+  <h1>YouTube to Notion</h1>
+</div>
+
+<div class="body">
+
+  <!-- 服务状态 -->
+  <div class="server-status">
+    <div class="dot" id="dot"></div>
+    <span id="server-status-text">检查本地服务...</span>
+  </div>
+
+  <!-- 断点续传提示 -->
+  <div class="resume-banner" id="resume-banner">
+    <span id="resume-text">检测到上次未完成的任务</span>
+    <button id="btn-clear-cache">清除重来</button>
+  </div>
+
+  <!-- Notion 配置 -->
+  <div class="field">
+    <label>Notion Token</label>
+    <input type="password" id="notion-token" placeholder="secret_xxxxxxxxxxxx" />
+  </div>
+  <div class="field">
+    <label>Database ID</label>
+    <input type="text" id="database-id" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" />
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- 高级设置 -->
+  <div class="advanced-toggle" id="advanced-toggle">
+    <span id="toggle-arrow">▶</span> 高级设置
+  </div>
+  <div class="advanced" id="advanced-panel">
+    <div class="row">
+      <div class="field">
+        <label>去重阈值 (0-64)</label>
+        <input type="number" id="hash-threshold" value="10" min="0" max="64" />
+      </div>
+      <div class="field">
+        <label>最大句数</label>
+        <input type="number" id="max-sentences" value="8" min="1" max="50" />
+      </div>
+    </div>
+    <div class="field">
+      <label>强制分段秒数</label>
+      <input type="number" id="max-seconds" value="30" min="5" max="300" />
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- 操作按钮 -->
+  <button class="btn btn-primary" id="btn-start" disabled>开始处理</button>
+
+  <!-- 进度区 -->
+  <div class="status-box" id="status-box">
+    <div class="status-msg" id="status-msg">准备中...</div>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+  </div>
+
+  <!-- 错误提示 -->
+  <div class="error-msg" id="error-msg"></div>
+
+  <!-- 完成链接 -->
+  <a class="result-link" id="result-link" href="#" target="_blank">
+    ✅ 在 Notion 中查看
+  </a>
+
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
