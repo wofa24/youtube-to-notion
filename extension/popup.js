@@ -205,7 +205,12 @@ async function onStartClick() {
     });
 
     if (!resp.ok) {
-      const err = await resp.json();
+      const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409) {
+        showError(`⏳ ${err.detail || "已有任务正在运行，请等待完成后再提交"}`);
+        btnStart.disabled = false;
+        return;
+      }
       throw new Error(err.detail || "提交失败");
     }
 

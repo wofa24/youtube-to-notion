@@ -227,6 +227,18 @@ def start_process(req: ProcessRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # 拒绝并发：若已有任务在运行，返回 409
+    running = next(
+        (tid for tid, t in _tasks.items() if t.get("status") == "running"),
+        None,
+    )
+    if running:
+        running_title = _tasks[running].get("title") or running
+        raise HTTPException(
+            status_code=409,
+            detail=f"已有任务正在运行（{running_title}），请等待完成后再提交",
+        )
+
     task_id = video_id
     _tasks[task_id] = {
         "status": "pending",
